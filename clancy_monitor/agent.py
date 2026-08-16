@@ -15,6 +15,7 @@ from scrapers.news_scraper import scrape_news
 from scrapers.twitter_scraper import scrape_twitter
 from scrapers.tiktok_scraper import scrape_tiktok
 from scrapers.meta_scraper import scrape_facebook, scrape_instagram
+from scrapers.reddit_scraper import scrape_reddit
 from brief_generator import generate_brief
 
 
@@ -33,6 +34,7 @@ def collect_all() -> list:
     results += scrape_tiktok()
     results += scrape_facebook()
     results += scrape_instagram()
+    results += scrape_reddit()
 
     # Deduplicate by URL
     seen_urls: set = set()
