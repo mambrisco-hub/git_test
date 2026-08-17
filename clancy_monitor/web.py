@@ -19,8 +19,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, redirect, render_template_string, request, url_for
-from markupsafe import Markup
+from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, url_for
 
 app = Flask(__name__)
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", Path(__file__).parent / "output"))
@@ -99,9 +98,7 @@ def _brief_to_html(text: str) -> str:
 
 # ── Shared CSS ──────────────────────────────────────────────────────────────
 
-CSS = Markup("""
-<style>
-:root{--bg:#F5F4EF;--sf:#EDEBE4;--br:#C8C5BC;--tx:#1A1917;--mu:#6B6860;--rd:#9B2626;--bl:#1C3A72;--gb:#E6F0E8;--gt:#1D5C35;--ab:#F5EDD8;--at:#6B4A00;--rb:#F5E4E4;--rt:#7A1E1E;--pb:#EDE8F5;--pt:#3D2A6B}
+CSS_TEXT = """:root{--bg:#F5F4EF;--sf:#EDEBE4;--br:#C8C5BC;--tx:#1A1917;--mu:#6B6860;--rd:#9B2626;--bl:#1C3A72;--gb:#E6F0E8;--gt:#1D5C35;--ab:#F5EDD8;--at:#6B4A00;--rb:#F5E4E4;--rt:#7A1E1E;--pb:#EDE8F5;--pt:#3D2A6B}
 @media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0E0D0B;--sf:#171614;--br:#2A2926;--tx:#E8E5DC;--mu:#8A877E;--rd:#C94040;--bl:#6B8FD4;--gb:#0F2218;--gt:#5EC47E;--ab:#1E1600;--at:#D4A83A;--rb:#200A0A;--rt:#D46060;--pb:#140E22;--pt:#B09AE0}}
 :root[data-theme=dark]{--bg:#0E0D0B;--sf:#171614;--br:#2A2926;--tx:#E8E5DC;--mu:#8A877E;--rd:#C94040;--bl:#6B8FD4;--gb:#0F2218;--gt:#5EC47E;--ab:#1E1600;--at:#D4A83A;--rb:#200A0A;--rt:#D46060;--pb:#140E22;--pt:#B09AE0}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -122,8 +119,7 @@ a{color:var(--bl)}
 .sp{height:.5rem}
 hr.rule{border:none;border-top:1.5px solid var(--br);margin:1.8rem 0}
 p{margin:.5rem 0}
-</style>
-""")
+"""
 
 
 # ── Templates ───────────────────────────────────────────────────────────────
@@ -131,7 +127,7 @@ p{margin:.5rem 0}
 INDEX_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clancy Case Monitor</title>
-{{ css }}
+<link rel="stylesheet" href="/style.css">
 <style>
 h1{font-size:1.35rem;margin-bottom:.25rem}
 .sub{font-family:"Courier New",monospace;font-size:.75rem;color:var(--mu);margin-bottom:2rem}
@@ -211,7 +207,7 @@ document.addEventListener('DOMContentLoaded',()=>{checkStatus();});
 BRIEF_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clancy Brief {{ date }}</title>
-{{ css }}
+<link rel="stylesheet" href="/style.css">
 <style>
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;flex-wrap:wrap;gap:.6rem}
 .back{font-family:"Courier New",monospace;font-size:.75rem;color:var(--mu);text-decoration:none}
@@ -231,6 +227,11 @@ BRIEF_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
+@app.route("/style.css")
+def stylesheet():
+    return Response(CSS_TEXT, mimetype="text/css")
+
+
 @app.route("/")
 def index():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -244,7 +245,7 @@ def index():
         except ValueError:
             label = date_str
         briefs.append({"date": date_str, "label": label})
-    return render_template_string(INDEX_TMPL, briefs=briefs, css=CSS)
+    return render_template_string(INDEX_TMPL, briefs=briefs)
 
 
 @app.route("/generate", methods=["POST"])
@@ -283,7 +284,7 @@ def view_brief(date_str: str):
     if not path.exists():
         abort(404)
     raw = path.read_text(encoding="utf-8")
-    return render_template_string(BRIEF_TMPL, date=date_str, content=_brief_to_html(raw), css=CSS)
+    return render_template_string(BRIEF_TMPL, date=date_str, content=_brief_to_html(raw))
 
 
 @app.route("/health")
