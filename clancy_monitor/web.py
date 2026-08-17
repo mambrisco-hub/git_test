@@ -130,7 +130,7 @@ p{margin:.5rem 0}
 INDEX_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clancy Case Monitor</title>
-{{ css }}
+{{ css|safe }}
 <style>
 h1{font-size:1.35rem;margin-bottom:.25rem}
 .sub{font-family:"Courier New",monospace;font-size:.75rem;color:var(--mu);margin-bottom:2rem}
@@ -210,7 +210,7 @@ document.addEventListener('DOMContentLoaded',()=>{checkStatus();});
 BRIEF_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clancy Brief {{ date }}</title>
-{{ css }}
+{{ css|safe }}
 <style>
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;flex-wrap:wrap;gap:.6rem}
 .back{font-family:"Courier New",monospace;font-size:.75rem;color:var(--mu);text-decoration:none}
