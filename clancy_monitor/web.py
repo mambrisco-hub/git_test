@@ -1,154 +1,231 @@
-"""Flask web server — browse and read generated briefs in the browser.
+"""Flask web server — browse briefs and trigger generation on demand.
 
-Railway will run this as the web service. Brief files are read from
-OUTPUT_DIR (defaults to ./output, override with the OUTPUT_DIR env var
-or by mounting a Railway volume at /data and setting OUTPUT_DIR=/data/output).
+Railway runs this as the web service. Briefs are stored in OUTPUT_DIR
+(default ./output; set OUTPUT_DIR=/data/output when using a Railway Volume).
+
+Routes:
+  GET  /                — list all briefs, with a Generate button
+  GET  /brief/latest    — redirect to most recent brief
+  GET  /brief/<date>    — view a specific brief
+  POST /generate        — kick off agent.py in a background thread
+  GET  /status          — JSON status of any running generation
+  GET  /health          — Railway health check
 """
 
 import os
 import re
+import subprocess
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-from flask import Flask, abort, render_template_string
+
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, url_for
 
 app = Flask(__name__)
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", Path(__file__).parent / "output"))
 
-# ── Brief → HTML conversion ────────────────────────────────────────────────
+# ── Generation state ────────────────────────────────────────────────────────
 
-def _text_to_html(text: str) -> str:
-    """Convert plain-text brief to lightweight HTML."""
-    lines = text.splitlines()
-    html_lines = []
-    for line in lines:
-        esc = (line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+_gen_lock = threading.Lock()
+_gen_state = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "last_date": None,
+}
 
-        if re.match(r"^[═─━]{5,}", esc):
-            html_lines.append('<hr class="rule">')
-        elif esc.startswith("  ") and re.match(r"^\s+\w", esc):
-            html_lines.append(f'<p class="indent">{esc.strip()}</p>')
-        elif re.match(r"^[IVX]+\.\s", esc):
-            html_lines.append(f'<h2 class="section-h">{esc}</h2>')
-        elif re.match(r"^¶\d+", esc):
-            num, _, rest = esc.partition(" ")
-            html_lines.append(
-                f'<div class="fact-row"><span class="para-n">{num}</span>'
-                f'<span class="para-body">{rest}</span></div>'
-            )
-        elif re.match(r"^AT A GLANCE|^COMMONWEALTH v\.|^Daily Case Brief|^Docket No\.", esc):
-            html_lines.append(f'<p class="caption-line">{esc}</p>')
-        elif re.match(r"^\s*▸", esc):
-            html_lines.append(f'<li class="glance-item">{esc.lstrip("▸ ").strip()}</li>')
-        elif re.match(r"^\s*─+\s*$", esc):
-            html_lines.append('<hr class="minor-rule">')
-        elif esc.strip() == "":
-            html_lines.append('<div class="spacer"></div>')
+
+def _run_agent():
+    with _gen_lock:
+        _gen_state["running"] = True
+        _gen_state["started_at"] = datetime.now(timezone.utc).isoformat()
+        _gen_state["error"] = None
+
+    try:
+        result = subprocess.run(
+            ["python", str(Path(__file__).parent / "agent.py")],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(Path(__file__).parent),
+        )
+        if result.returncode != 0:
+            _gen_state["error"] = (result.stderr or result.stdout)[-1000:]
         else:
-            flagged = re.sub(
-                r"\[(UNCONFIRMED|UNVERIFIED|SLEUTH THEORY|FALSE|TRUE|PARTIAL|DISPUTED|JURY POOL RISK)\]",
-                r'<span class="flag flag-\1">\1</span>',
-                esc,
-            )
-            html_lines.append(f'<p>{flagged}</p>')
+            _gen_state["last_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    except subprocess.TimeoutExpired:
+        _gen_state["error"] = "Agent timed out after 10 minutes."
+    except Exception as exc:
+        _gen_state["error"] = str(exc)
+    finally:
+        _gen_state["running"] = False
+        _gen_state["finished_at"] = datetime.now(timezone.utc).isoformat()
 
-    return "\n".join(html_lines)
+
+# ── Brief → HTML ────────────────────────────────────────────────────────────
+
+def _brief_to_html(text: str) -> str:
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        e = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        def flag(m):
+            word = m.group(1).replace(" ", "-")
+            return f'<span class="flag flag-{word}">{m.group(1)}</span>'
+
+        e = re.sub(
+            r"\[(UNCONFIRMED|UNVERIFIED|SLEUTH THEORY|FALSE|TRUE|PARTIAL|DISPUTED|JURY POOL RISK)\]",
+            flag, e,
+        )
+
+        if re.match(r"^[═─━]{5,}", e):
+            out.append('<hr class="rule">')
+        elif re.match(r"^[IVX]+\.\s", e.strip()):
+            out.append(f'<h2 class="sh">{e.strip()}</h2>')
+        elif re.match(r"^¶\d+", e.strip()):
+            num, _, rest = e.strip().partition(" ")
+            out.append(f'<div class="fp"><span class="pn">{num}</span><span>{rest}</span></div>')
+        elif re.match(r"^\s*▸", e):
+            out.append(f'<li class="gi">{e.lstrip("▸ ").strip()}</li>')
+        elif e.strip() == "":
+            out.append('<div class="sp"></div>')
+        else:
+            out.append(f'<p>{e}</p>')
+    return "\n".join(out)
+
+
+# ── Shared CSS ──────────────────────────────────────────────────────────────
+
+CSS = """
+<style>
+:root{--bg:#F5F4EF;--sf:#EDEBE4;--br:#C8C5BC;--tx:#1A1917;--mu:#6B6860;--rd:#9B2626;--bl:#1C3A72;--gb:#E6F0E8;--gt:#1D5C35;--ab:#F5EDD8;--at:#6B4A00;--rb:#F5E4E4;--rt:#7A1E1E;--pb:#EDE8F5;--pt:#3D2A6B}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0E0D0B;--sf:#171614;--br:#2A2926;--tx:#E8E5DC;--mu:#8A877E;--rd:#C94040;--bl:#6B8FD4;--gb:#0F2218;--gt:#5EC47E;--ab:#1E1600;--at:#D4A83A;--rb:#200A0A;--rt:#D46060;--pb:#140E22;--pt:#B09AE0}}
+:root[data-theme=dark]{--bg:#0E0D0B;--sf:#171614;--br:#2A2926;--tx:#E8E5DC;--mu:#8A877E;--rd:#C94040;--bl:#6B8FD4;--gb:#0F2218;--gt:#5EC47E;--ab:#1E1600;--at:#D4A83A;--rb:#200A0A;--rt:#D46060;--pb:#140E22;--pt:#B09AE0}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:Georgia,serif;font-size:15px;line-height:1.75;padding:2rem 1rem 4rem}
+.wrap{max-width:760px;margin:0 auto}
+.cap-rule{height:4px;background:var(--rd);margin-bottom:2rem}
+a{color:var(--bl)}
+.flag{display:inline-block;font-family:"Courier New",monospace;font-size:.68rem;font-weight:bold;padding:.1em .45em;border-radius:2px;vertical-align:middle;margin:0 .2rem;text-transform:uppercase}
+.flag-UNCONFIRMED,.flag-UNVERIFIED{background:var(--ab);color:var(--at)}
+.flag-SLEUTH-THEORY{background:var(--pb);color:var(--pt)}
+.flag-FALSE,.flag-DISPUTED,.flag-JURY-POOL-RISK{background:var(--rb);color:var(--rt)}
+.flag-TRUE{background:var(--gb);color:var(--gt)}
+.flag-PARTIAL{background:var(--ab);color:var(--at)}
+.sh{font-family:"Courier New",monospace;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;color:var(--mu);margin:2rem 0 .9rem}
+.fp{display:grid;grid-template-columns:2.4rem 1fr;gap:0 .6rem;margin:.75rem 0}
+.pn{font-family:"Courier New",monospace;font-size:.82rem;color:var(--rd);text-align:right;padding-top:.1em}
+.gi{margin-left:1.5rem;margin-bottom:.4rem}
+.sp{height:.5rem}
+hr.rule{border:none;border-top:1.5px solid var(--br);margin:1.8rem 0}
+p{margin:.5rem 0}
+</style>
+"""
 
 
 # ── Templates ───────────────────────────────────────────────────────────────
 
-INDEX_TMPL = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
+INDEX_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clancy Case Monitor</title>
+{{ css }}
 <style>
-:root{--bg:#F5F4EF;--surface:#EDEBE4;--border:#C8C5BC;--text:#1A1917;--muted:#6B6860;--red:#9B2626;--blue:#1C3A72}
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0E0D0B;--surface:#171614;--border:#2A2926;--text:#E8E5DC;--muted:#8A877E;--red:#C94040;--blue:#6B8FD4}}
-:root[data-theme=dark]{--bg:#0E0D0B;--surface:#171614;--border:#2A2926;--text:#E8E5DC;--muted:#8A877E;--red:#C94040;--blue:#6B8FD4}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:Georgia,serif;padding:2rem 1rem 4rem}
-.wrap{max-width:680px;margin:0 auto}
-.cap-rule{height:4px;background:var(--red);margin-bottom:2rem}
-h1{font-size:1.3rem;margin-bottom:.3rem}
-.subtitle{font-family:"Courier New",monospace;font-size:.75rem;color:var(--muted);margin-bottom:2rem}
-.brief-list{list-style:none;display:flex;flex-direction:column;gap:.6rem}
-.brief-item a{display:flex;justify-content:space-between;align-items:center;padding:.9rem 1.1rem;background:var(--surface);border:1px solid var(--border);color:var(--text);text-decoration:none;font-family:"Courier New",monospace;font-size:.85rem}
-.brief-item a:hover{border-color:var(--red)}
+h1{font-size:1.35rem;margin-bottom:.25rem}
+.sub{font-family:"Courier New",monospace;font-size:.75rem;color:var(--mu);margin-bottom:2rem}
+.toolbar{display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}
+.btn{font-family:"Courier New",monospace;font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;padding:.55rem 1.1rem;border:none;cursor:pointer;text-decoration:none;display:inline-block}
+.btn-primary{background:var(--rd);color:#fff}
+.btn-primary:hover{opacity:.88}
+.btn-primary:disabled{opacity:.45;cursor:not-allowed}
+.status-msg{font-family:"Courier New",monospace;font-size:.72rem;color:var(--mu)}
+.status-ok{color:var(--gt)}
+.status-err{color:var(--rt)}
+.brief-list{list-style:none;display:flex;flex-direction:column;gap:.55rem}
+.brief-item a{display:flex;justify-content:space-between;align-items:center;padding:.85rem 1.1rem;background:var(--sf);border:1px solid var(--br);color:var(--tx);text-decoration:none;font-family:"Courier New",monospace;font-size:.85rem}
+.brief-item a:hover{border-color:var(--rd)}
 .brief-date{font-weight:bold}
-.brief-label{color:var(--muted);font-size:.72rem}
-.empty{color:var(--muted);font-family:"Courier New",monospace;font-size:.85rem;padding:1.5rem 0}
+.brief-arr{color:var(--mu);font-size:.72rem}
+.empty{color:var(--mu);font-family:"Courier New",monospace;font-size:.85rem;padding:1rem 0}
+#gen-status{display:none}
 </style>
-</head>
-<body>
+<script>
+function submitGenerate(e){
+  const btn=document.getElementById('gen-btn');
+  const msg=document.getElementById('gen-status');
+  btn.disabled=true;
+  btn.textContent='Generating…';
+  msg.style.display='inline';
+  msg.textContent='Running — this takes about 60 seconds. Refresh the page in a minute.';
+  msg.className='status-msg';
+}
+function checkStatus(){
+  fetch('/status').then(r=>r.json()).then(d=>{
+    const btn=document.getElementById('gen-btn');
+    const msg=document.getElementById('gen-status');
+    if(d.running){
+      btn.disabled=true;btn.textContent='Generating…';
+      msg.style.display='inline';msg.textContent='Running… refresh in a moment.';
+      msg.className='status-msg';
+      setTimeout(checkStatus,5000);
+    } else {
+      btn.disabled=false;btn.textContent='Generate Now';
+      if(d.error){msg.style.display='inline';msg.textContent='Error: '+d.error.slice(0,120);msg.className='status-msg status-err';}
+      else if(d.finished_at){msg.style.display='inline';msg.textContent='Done — reload to see the new brief.';msg.className='status-msg status-ok';}
+    }
+  }).catch(()=>setTimeout(checkStatus,8000));
+}
+document.addEventListener('DOMContentLoaded',()=>{checkStatus();});
+</script>
+</head><body>
 <div class="wrap">
   <div class="cap-rule"></div>
   <h1>Commonwealth v. Lindsay Clancy</h1>
-  <p class="subtitle">CLANCY CASE MONITOR — DAILY BRIEFS</p>
+  <p class="sub">CLANCY CASE MONITOR — DAILY BRIEFS</p>
+
+  <div class="toolbar">
+    <form method="POST" action="/generate" onsubmit="submitGenerate(event)">
+      <button class="btn btn-primary" id="gen-btn" type="submit">Generate Now</button>
+    </form>
+    <span id="gen-status" class="status-msg"></span>
+  </div>
+
   {% if briefs %}
   <ul class="brief-list">
     {% for b in briefs %}
     <li class="brief-item">
       <a href="/brief/{{ b.date }}">
         <span class="brief-date">{{ b.label }}</span>
-        <span class="brief-label">VIEW BRIEF →</span>
+        <span class="brief-arr">VIEW →</span>
       </a>
     </li>
     {% endfor %}
   </ul>
   {% else %}
-  <p class="empty">No briefs generated yet. Run <code>python agent.py</code> to generate the first one.</p>
+  <p class="empty">No briefs yet — hit Generate Now to create the first one.</p>
   {% endif %}
-</div>
-</body>
-</html>
-"""
+</div></body></html>"""
 
-BRIEF_TMPL = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
+BRIEF_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clancy Brief {{ date }}</title>
+{{ css }}
 <style>
-:root{--bg:#F5F4EF;--surface:#EDEBE4;--border:#C8C5BC;--text:#1A1917;--muted:#6B6860;--red:#9B2626;--blue:#1C3A72;--green-bg:#E6F0E8;--green-txt:#1D5C35;--amber-bg:#F5EDD8;--amber-txt:#6B4A00;--red-bg:#F5E4E4;--red-txt:#7A1E1E;--purple-bg:#EDE8F5;--purple-txt:#3D2A6B}
-@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0E0D0B;--surface:#171614;--border:#2A2926;--text:#E8E5DC;--muted:#8A877E;--red:#C94040;--blue:#6B8FD4;--green-bg:#0F2218;--green-txt:#5EC47E;--amber-bg:#1E1600;--amber-txt:#D4A83A;--red-bg:#200A0A;--red-txt:#D46060;--purple-bg:#140E22;--purple-txt:#B09AE0}}
-:root[data-theme=dark]{--bg:#0E0D0B;--surface:#171614;--border:#2A2926;--text:#E8E5DC;--muted:#8A877E;--red:#C94040;--blue:#6B8FD4;--green-bg:#0F2218;--green-txt:#5EC47E;--amber-bg:#1E1600;--amber-txt:#D4A83A;--red-bg:#200A0A;--red-txt:#D46060;--purple-bg:#140E22;--purple-txt:#B09AE0}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:Georgia,serif;font-size:15px;line-height:1.75;padding:2rem 1rem 4rem}
-.wrap{max-width:760px;margin:0 auto}
-.cap-rule{height:4px;background:var(--red);margin-bottom:2rem}
-.back{font-family:"Courier New",monospace;font-size:.75rem;color:var(--muted);text-decoration:none;display:inline-block;margin-bottom:1.5rem}
-.back:hover{color:var(--red)}
-hr.rule{border:none;border-top:1.5px solid var(--border);margin:1.8rem 0}
-hr.minor-rule{border:none;border-top:1px solid var(--border);margin:1rem 0}
-.section-h{font-family:"Courier New",monospace;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:2rem 0 .9rem}
-.caption-line{font-family:"Courier New",monospace;font-size:.82rem;color:var(--muted);text-align:center;line-height:1.8}
-.fact-row{display:grid;grid-template-columns:2.4rem 1fr;gap:0 .6rem;margin:.75rem 0}
-.para-n{font-family:"Courier New",monospace;font-size:.82rem;color:var(--red);text-align:right;padding-top:.1em}
-.glance-item{margin-left:1.5rem;margin-bottom:.4rem}
-.spacer{height:.5rem}
-.indent{padding-left:1.5rem}
-.flag{display:inline-block;font-family:"Courier New",monospace;font-size:.68rem;font-weight:bold;padding:.1em .45em;border-radius:2px;vertical-align:middle;margin:0 .2rem;text-transform:uppercase}
-.flag-UNCONFIRMED,.flag-UNVERIFIED{background:var(--amber-bg);color:var(--amber-txt)}
-.flag-SLEUTH\.THEORY,.flag-SLEUTH.THEORY{background:var(--purple-bg);color:var(--purple-txt)}
-.flag-FALSE,.flag-DISPUTED{background:var(--red-bg);color:var(--red-txt)}
-.flag-TRUE{background:var(--green-bg);color:var(--green-txt)}
-.flag-PARTIAL{background:var(--amber-bg);color:var(--amber-txt)}
-p{margin:.5rem 0}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;flex-wrap:wrap;gap:.6rem}
+.back{font-family:"Courier New",monospace;font-size:.75rem;color:var(--mu);text-decoration:none}
+.back:hover{color:var(--rd)}
+.btn-sm{font-family:"Courier New",monospace;font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;padding:.4rem .9rem;background:var(--rd);color:#fff;border:none;cursor:pointer;text-decoration:none}
 </style>
-</head>
-<body>
+</head><body>
 <div class="wrap">
   <div class="cap-rule"></div>
-  <a class="back" href="/">← All Briefs</a>
-  <div>{{ content|safe }}</div>
-</div>
-</body>
-</html>
-"""
+  <div class="topbar">
+    <a class="back" href="/">← All Briefs</a>
+    <a class="btn-sm" href="/">↺ Generate New</a>
+  </div>
+  {{ content|safe }}
+</div></body></html>"""
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -166,7 +243,26 @@ def index():
         except ValueError:
             label = date_str
         briefs.append({"date": date_str, "label": label})
-    return render_template_string(INDEX_TMPL, briefs=briefs)
+    return render_template_string(INDEX_TMPL, briefs=briefs, css=CSS)
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    if not _gen_state["running"]:
+        t = threading.Thread(target=_run_agent, daemon=True)
+        t.start()
+    return redirect(url_for("index"))
+
+
+@app.route("/status")
+def status():
+    return jsonify({
+        "running": _gen_state["running"],
+        "started_at": _gen_state["started_at"],
+        "finished_at": _gen_state["finished_at"],
+        "error": _gen_state["error"],
+        "last_date": _gen_state["last_date"],
+    })
 
 
 @app.route("/brief/latest")
@@ -175,7 +271,6 @@ def latest():
     if not briefs:
         abort(404)
     date_str = briefs[0].stem.replace("brief_", "")
-    from flask import redirect
     return redirect(f"/brief/{date_str}")
 
 
@@ -187,8 +282,7 @@ def view_brief(date_str: str):
     if not path.exists():
         abort(404)
     raw = path.read_text(encoding="utf-8")
-    html_content = _text_to_html(raw)
-    return render_template_string(BRIEF_TMPL, date=date_str, content=html_content)
+    return render_template_string(BRIEF_TMPL, date=date_str, content=_brief_to_html(raw), css=CSS)
 
 
 @app.route("/health")

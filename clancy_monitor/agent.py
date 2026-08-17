@@ -17,7 +17,6 @@ from scrapers.tiktok_scraper import scrape_tiktok
 from scrapers.meta_scraper import scrape_facebook, scrape_instagram
 from scrapers.reddit_scraper import scrape_reddit
 from brief_generator import generate_brief
-from deliver import send_brief
 
 
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -112,7 +111,6 @@ def run(dry_run: bool = False, load_raw: str | None = None) -> None:
 
     brief = generate_brief(articles)
     save_brief(brief, today)
-    send_brief(brief, today)  # no-op if SMTP env vars not set
 
     print("\n" + "=" * 70)
     print(brief[:3000] + ("\n\n[… brief continues in output file …]" if len(brief) > 3000 else ""))
