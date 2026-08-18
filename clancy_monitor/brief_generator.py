@@ -109,7 +109,7 @@ def _cluster_articles(client: anthropic.Anthropic, articles: List[Article]) -> L
             ),
         }],
     )
-    raw = msg.content[0].text.strip()
+    raw = next(b.text for b in msg.content if b.type == "text").strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:])
         raw = raw.rsplit("```", 1)[0]
@@ -186,6 +186,6 @@ def generate_brief(articles: List[Article]) -> str:
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    brief = msg.content[0].text
+    brief = next(b.text for b in msg.content if b.type == "text")
     brief += "\n\n" + _source_index(articles)
     return brief
